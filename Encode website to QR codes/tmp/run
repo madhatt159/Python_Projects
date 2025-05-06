@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+import os
+import sys
+import zlib
+import base64
+import requests
+from io import BytesIO
+from PIL import Image
+import qrcode
+from concurrent.futures import ThreadPoolExecutor
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+# register CJK font for Chinese
+pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+
+# page & QR dimensions
+LETTER_W_IN = 8.5
+LETTER_H_IN = 11
+FINAL_W_MM = 100
+FINAL_W_IN = FINAL_W_MM / 25.4       # ≈3.937"
+ROWS = 2                              # two QRs tall
+DPI = 600
+QR_PIXELS = int(DPI * FINAL_W_IN)
+CHUNK_SIZE = 800                      # bytes per QR
+JPEG_MAX = 300
+JPEG_Q = 40
+
+# core logic functions
+
+def downscale(content):
+    try:
+        img = Image.open(BytesIO(content))
+        w = min(JPEG_MAX, img.width)
+        h = int(img.height * (w / img.width))
+        img = img.resize((w, h), Image.LANCZOS)
+        buf = BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=JPEG_Q)
+        return buf.getvalue(), "image/jpeg"
+    except:
+        return content, "image/png"
+
+
+def inline_images(html, base_url):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("img"):
+        src = tag.get("src")
+        if not src:
+            continue
+        try:
+            url = requests.compat.urljoin(base_url, src)
+            r = requests.get(url, timeout=5)
+            data, mime = downscale(r.content)
+            b64 = base64.b64encode(data).decode()
+            tag["src"] = f"data:{mime};base64,{b64}"
+        except:
+            tag.decompose()
+    return str(soup)
+
+
+def chunk_data(data_str):
+    return [data_str[i:i+CHUNK_SIZE] for i in range(0, len(data_str), CHUNK_SIZE)]
+
+
+def make_qr(data_str):
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_H, border=4)
+    qr.add_data(data_str)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    return img.resize((QR_PIXELS, QR_PIXELS), Image.NEAREST)
+
+
+def qr_to_buffer(data_str):
+    buf = BytesIO()
+    make_qr(data_str).save(buf, format="PNG", dpi=(DPI, DPI))
+    buf.seek(0)
+    return buf
+
+
+def write_pdf(buffers, out_path, stats):
+    W_pt = LETTER_W_IN * inch
+    H_pt = LETTER_H_IN * inch
+    crop_w = FINAL_W_IN * inch
+    crop_h = ROWS * FINAL_W_IN * inch
+    x0 = (W_pt - crop_w) / 2
+    y0 = (H_pt - crop_h) / 2
+
+    c = canvas.Canvas(out_path, pagesize=(W_pt, H_pt))
+
+    # --- first page: stats + instructions ---
+    y = H_pt - inch
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(inch/2, y, "DATA STATISTICS")
+    y -= 18
+    c.setFont("Helvetica", 12)
+    c.drawString(inch/2, y, f"Original size   : {stats['raw_size']} bytes")
+    y -= 14
+    c.drawString(inch/2, y, f"Compressed size : {stats['compressed_size']} bytes")
+    y -= 14
+    c.drawString(inch/2, y, f"Base64 size     : {stats['b64_size']} bytes")
+    y -= 14
+    c.drawString(inch/2, y, f"Total QR codes  : {stats['num_chunks']}")
+    y -= 24
+
+    # instructions in EN, ES, ZH
+    for label, lines, font in [
+        ("Helvetica-Bold", [
+            "DECODING INSTRUCTIONS (EN):",
+            "1. Scan all QR codes in order.",
+            "2. Concatenate the scanned outputs.",
+            "3. Base64-decode the result.",
+            "4. zlib-decompress the output.",
+        ], "Helvetica-Bold"),
+        ("Helvetica-Bold", [
+            "INSTRUCCIONES DE DECODIFICACIÓN (ES):",
+            "1. Escanee todos los códigos QR en orden.",
+            "2. Concatenar las salidas escaneadas.",
+            "3. Decodificar Base64 el resultado.",
+            "4. Descomprimir con zlib la salida.",
+        ], "Helvetica-Bold"),
+        ("STSong-Light", [
+            "解码说明 (ZH)：",
+            "1. 按顺序扫描所有二维码。",
+            "2. 将扫描输出连接成一个字符串。",
+            "3. 对结果进行 Base64 解码。",
+            "4. 使用 zlib 解压缩输出。",
+        ], "STSong-Light"),
+    ]:
+        c.setFont(font, 12)
+        for line in lines:
+            c.drawString(inch/2, y, line)
+            y -= 14
+        y -= 10
+
+    c.showPage()
+
+    # --- subsequent pages: QR codes with crop marks ---
+    pages = [buffers[i:i+ROWS] for i in range(0, len(buffers), ROWS)]
+    for group in pages:
+        mark = 10
+        corners = [(x0, y0), (x0+crop_w, y0), (x0, y0+crop_h), (x0+crop_w, y0+crop_h)]
+        for cx, cy in corners:
+            c.line(cx-mark, cy, cx+mark, cy)
+            c.line(cx, cy-mark, cx, cy+mark)
+        for idx, buf in enumerate(group):
+            row = ROWS - 1 - idx
+            x = x0
+            y = y0 + row * FINAL_W_IN * inch
+            c.drawImage(ImageReader(buf), x, y, width=crop_w, height=FINAL_W_IN*inch)
+        c.showPage()
+
+    c.save()
+
+# GUI Application\ class QRApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("QR PDF Generator")
+
+        # Input type: URL or File
+        tk.Label(root, text="Input:").grid(row=0, column=0, sticky="e")
+        self.input_var = tk.StringVar(value="https://example.com")
+        tk.Entry(root, textvariable=self.input_var, width=40).grid(row=0, column=1, columnspan=2, pady=2)
+        self.file_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(root, text="Local file", variable=self.file_var).grid(row=0, column=3)
+        tk.Button(root, text="Browse Input...", command=self.browse_input).grid(row=0, column=4)
+
+        # Output file
+        tk.Label(root, text="Save As:").grid(row=1, column=0, sticky="e")
+        self.out_var = tk.StringVar()
+        tk.Entry(root, textvariable=self.out_var, width=30).grid(row=1, column=1, columnspan=2, pady=2)
+        tk.Button(root, text="Browse Output...", command=self.browse_output).grid(row=1, column=4)
+
+        # Threads
+        tk.Label(root, text="Threads:").grid(row=2, column=0, sticky="e")
+        self.thread_var = tk.IntVar(value=1)
+        for i in range(1, 9):
+            tk.Radiobutton(root, text=str(i), variable=self.thread_var, value=i).grid(row=2, column=i)
+
+        # Process button
+        tk.Button(root, text="Process", command=self.start).grid(row=3, column=1, pady=10)
+        self.status = tk.Label(root, text="Ready.")
+        self.status.grid(row=4, column=0, columnspan=5)
+
+    def browse_input(self):
+        if self.file_var.get():
+            path = filedialog.askopenfilename()
+            if path:
+                self.input_var.set(path)
+        else:
+            # nothing
+            pass
+
+    def browse_output(self):
+        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files","*.pdf")])
+        if path:
+            self.out_var.set(path)
+
+    def start(self):
+        inp = self.input_var.get().strip()
+        out = self.out_var.get().strip()
+        threads = self.thread_var.get()
+        if not inp or not out:
+            messagebox.showerror("Error", "Input and output required")
+            return
+        self.toggle_ui(False)
+        threading.Thread(target=self.process, args=(inp, out, threads), daemon=True).start()
+
+    def toggle_ui(self, enabled):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for child in self.root.winfo_children():
+            try:
+                child.configure(state=state)
+            except:
+                pass
+        self.status.config(text="Processing...")
+
+    def process(self, inp, out, threads):
+        try:
+            # load & compress
+            if self.file_var.get():
+                raw = open(inp, 'rb').read()
+            else:
+                raw_html = requests.get(inp).text.encode()
+                full = b"<!DOCTYPE html>\n" + inline_images(raw_html.decode(), inp).encode()
+                raw = full
+            compressed = zlib.compress(raw)
+            b64 = base64.b64encode(compressed).decode()
+
+            stats = {
+                'raw_size': len(raw),
+                'compressed_size': len(compressed),
+                'b64_size': len(b64),
+                'num_chunks': len(chunk_data(b64))
+            }
+
+            chunks = chunk_data(b64)
+            buffers = []
+            total = len(chunks)
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                for i, buf in enumerate(ex.map(qr_to_buffer, chunks), start=1):
+                    buffers.append(buf)
+                    self.status.config(text=f"Generating QR {i}/{total}")
+
+            write_pdf(buffers, out, stats)
+            self.done(out)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.toggle_ui(True)
+
+    def done(self, out):
+        def open_file():
+            if sys.platform.startswith('darwin'):
+                os.system(f'open "{out}"')
+            elif sys.platform.startswith('win'):
+                os.startfile(out)
+            else:
+                os.system(f'xdg-open "{out}"')
+        resp = messagebox.askyesno("Done", f"Saved to {out}.\nOpen PDF?")
+        if resp:
+            open_file()
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = QRApp(root)
+    root.mainloop()
+
